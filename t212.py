@@ -1,16 +1,20 @@
 """
 Trading 212 API Integration
 ============================
-Manages the Congress Tracker pie via the T212 public API.
+Manages the Congress Tracker pie. Saves the pie ID to disk
+so it can find and update the existing pie reliably.
 """
 
 import base64
 import json
+import os
 import time
 
 import requests
 
-from config import T212_API_KEY, T212_API_SECRET, T212_BASE_URL, PIE_NAME
+from config import T212_API_KEY, T212_API_SECRET, T212_BASE_URL, PIE_NAME, DATA_DIR
+
+PIE_ID_FILE = f"{DATA_DIR}/pie_id.json"
 
 
 def _get_auth_header():
@@ -52,63 +56,78 @@ def get_all_pies():
 
 
 def find_instrument(ticker, instruments):
-    search_patterns = [f"{ticker}_US_EQ", f"{ticker}_EQ", ticker]
     for inst in instruments:
-        t212_ticker = inst.get("ticker", "")
-        short_name = inst.get("shortName", "")
-        for pattern in search_patterns:
-            if t212_ticker == pattern or short_name == ticker:
-                return inst
+        t = inst.get("ticker", "")
+        s = inst.get("shortName", "")
+        if t == f"{ticker}_US_EQ" or t == f"{ticker}_EQ" or t == ticker or s == ticker:
+            return inst
     return None
 
 
-def find_congress_pie():
-    pies = get_all_pies()
-    for pie in pies:
-        if pie.get("settings", {}).get("name", "") == PIE_NAME:
-            return pie
+def save_pie_id(pie_id):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with open(PIE_ID_FILE, "w") as f:
+        json.dump({"pie_id": pie_id}, f)
+    print(f"[T212] Saved pie ID: {pie_id}")
+
+
+def load_pie_id():
+    if os.path.exists(PIE_ID_FILE):
+        with open(PIE_ID_FILE, "r") as f:
+            data = json.load(f)
+            return data.get("pie_id")
     return None
 
 
-def _build_instrument_shares(allocations, instruments):
-    """Convert ticker allocations to T212 format, ensuring shares sum to exactly 1.0"""
-    instrument_shares = {}
+def find_pie_id():
+    """Find pie ID — check saved file first, then search T212."""
+    saved = load_pie_id()
+    if saved:
+        print(f"[T212] Using saved pie ID: {saved}")
+        return saved
+    try:
+        pies = get_all_pies()
+        for pie in pies:
+            name = pie.get("settings", {}).get("name", "")
+            pid = pie.get("settings", {}).get("id") or pie.get("id")
+            if name == PIE_NAME and pid:
+                save_pie_id(pid)
+                return pid
+    except Exception as e:
+        print(f"[T212] Error searching pies: {e}")
+    return None
+
+
+def _build_shares(allocations, instruments):
+    shares = {}
     skipped = []
-
     for ticker, pct in allocations.items():
         inst = find_instrument(ticker, instruments)
         if inst:
-            t212_ticker = inst["ticker"]
-            instrument_shares[t212_ticker] = pct / 100.0
+            shares[inst["ticker"]] = pct / 100.0
         else:
             skipped.append(ticker)
-
     if skipped:
         print(f"[T212] Not available on T212: {', '.join(skipped)}")
-
-    if not instrument_shares:
+    if not shares:
         raise ValueError("No valid instruments found")
-
-    # Normalise to sum to exactly 1.0
-    total = sum(instrument_shares.values())
-    shares = {}
-    running_total = 0.0
-    items = list(instrument_shares.items())
-
-    for i, (ticker, val) in enumerate(items):
+    # Normalise to exactly 1.0
+    total = sum(shares.values())
+    items = list(shares.items())
+    result = {}
+    running = 0.0
+    for i, (t, v) in enumerate(items):
         if i == len(items) - 1:
-            # Last item gets whatever is left to ensure exact 1.0
-            shares[ticker] = round(1.0 - running_total, 4)
+            result[t] = round(1.0 - running, 4)
         else:
-            normalised = round(val / total, 4)
-            shares[ticker] = normalised
-            running_total += normalised
-
-    return shares, skipped
+            norm = round(v / total, 4)
+            result[t] = norm
+            running += norm
+    return result, skipped
 
 
 def create_pie(allocations, instruments):
-    shares, skipped = _build_instrument_shares(allocations, instruments)
+    shares, skipped = _build_shares(allocations, instruments)
     payload = {
         "name": PIE_NAME,
         "dividendCashAction": "REINVEST",
@@ -118,12 +137,16 @@ def create_pie(allocations, instruments):
         "instrumentShares": shares,
     }
     result = _make_request("POST", "/equity/pies", data=payload)
+    # Save the pie ID for future updates
+    pid = result.get("settings", {}).get("id") or result.get("id")
+    if pid:
+        save_pie_id(pid)
     print(f"[T212] Created pie '{PIE_NAME}' with {len(shares)} instruments")
     return result
 
 
 def update_pie(pie_id, allocations, instruments):
-    shares, skipped = _build_instrument_shares(allocations, instruments)
+    shares, skipped = _build_shares(allocations, instruments)
     payload = {
         "name": PIE_NAME,
         "dividendCashAction": "REINVEST",
@@ -139,14 +162,17 @@ def sync_pie(allocations):
     instruments = get_instruments()
     print(f"[T212] {len(instruments)} instruments available")
 
-    existing_pie = find_congress_pie()
+    pie_id = find_pie_id()
 
-    if existing_pie:
-        pie_id = existing_pie.get("settings", {}).get("id") or existing_pie.get("id")
-        print(f"[T212] Found existing pie (ID: {pie_id}), updating...")
-        result = update_pie(pie_id, allocations, instruments)
-    else:
-        print("[T212] No existing pie found, creating new one...")
-        result = create_pie(allocations, instruments)
+    if pie_id:
+        try:
+            print(f"[T212] Updating existing pie (ID: {pie_id})...")
+            return update_pie(pie_id, allocations, instruments)
+        except Exception as e:
+            print(f"[T212] Update failed: {e}, trying to create new...")
+            # Clear saved ID if update fails
+            if os.path.exists(PIE_ID_FILE):
+                os.remove(PIE_ID_FILE)
 
-    return result
+    print("[T212] Creating new pie...")
+    return create_pie(allocations, instruments)
