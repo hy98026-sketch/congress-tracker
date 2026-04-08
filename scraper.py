@@ -1,8 +1,8 @@
 """
 Congress Trade Scraper
 ======================
-Fetches ALL congress members' trades from FMP (Financial Modeling Prep).
-Free tier: 250 API calls/day — more than enough for hourly polling.
+Scrapes Capitol Trades (capitoltrades.com) for ALL congress trades.
+No API key needed — free public data.
 """
 
 import json
@@ -11,26 +11,20 @@ import re
 from datetime import datetime, timedelta
 
 import requests
+from bs4 import BeautifulSoup
 
 from config import DATA_DIR, TRADES_FILE, TICKER_BLACKLIST
 
-FMP_API_KEY = os.getenv("FMP_API_KEY", "")
-FMP_BASE = "https://financialmodelingprep.com/api/v4"
-
 HEADERS = {
-    "User-Agent": "CongressTracker/1.0",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+    ),
 }
 
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
-
-
-def load_existing_trades():
-    if os.path.exists(TRADES_FILE):
-        with open(TRADES_FILE, "r") as f:
-            return json.load(f)
-    return []
 
 
 def save_trades(trades):
@@ -45,105 +39,115 @@ def normalise_type(raw):
         return "buy"
     if any(k in r for k in ("sale", "sell")):
         return "sell"
-    if "exchange" in r:
-        return "exchange"
     return "other"
 
 
 def clean_ticker(raw):
-    t = raw.strip().upper().replace("--", "").replace(" ", "")
-    if not t or t == "N/A" or len(t) > 6:
-        return ""
-    if not re.match(r"^[A-Z.]{1,6}$", t):
-        return ""
-    return t
+    match = re.search(r"([A-Z]{1,5}):US", raw)
+    if match:
+        return match.group(1)
+    t = raw.strip().upper()
+    if re.match(r"^[A-Z]{1,5}$", t):
+        return t
+    return ""
 
 
 def is_valid_stock_trade(trade):
     ticker = trade.get("ticker", "")
-    if not ticker:
-        return False
-    if ticker in TICKER_BLACKLIST:
-        return False
-    desc = trade.get("asset_description", "").lower()
-    skip_keywords = ["option", "bond", "fund", "note", "municipal", "treasury", "etf"]
-    if any(kw in desc for kw in skip_keywords):
+    if not ticker or ticker in TICKER_BLACKLIST:
         return False
     return True
 
 
-def fetch_fmp_senate():
-    if not FMP_API_KEY:
-        print("[FMP] No API key set - add FMP_API_KEY to env vars")
-        return []
-    trades = []
-    url = f"{FMP_BASE}/senate-trading?page=0&apikey={FMP_API_KEY}"
-    try:
-        print("[Senate] Fetching from FMP...")
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        raw = resp.json()
-        print(f"[Senate] Raw trades: {len(raw)}")
-        for t in raw:
-            ticker = clean_ticker(t.get("asset", "") or t.get("ticker", ""))
-            if not ticker:
-                continue
-            trade = {
-                "source": "fmp_senate",
-                "politician": (t.get("firstName", "") + " " + t.get("lastName", "")).strip(),
-                "ticker": ticker,
-                "type": normalise_type(t.get("type", "")),
-                "date": t.get("transactionDate", ""),
-                "disclosure_date": t.get("disclosureDate", ""),
-                "amount": t.get("amount", ""),
-                "asset_description": t.get("assetDescription", ""),
-            }
-            if is_valid_stock_trade(trade):
-                trades.append(trade)
-    except requests.RequestException as e:
-        print(f"[Senate] Error: {e}")
-    print(f"[Senate] Valid stock trades: {len(trades)}")
-    return trades
+def scrape_capitol_trades(pages=3):
+    """Scrape recent trades from Capitol Trades website."""
+    all_trades = []
+    base_url = "https://www.capitoltrades.com/trades"
+
+    for page in range(1, pages + 1):
+        try:
+            url = f"{base_url}?page={page}" if page > 1 else base_url
+            print(f"[Capitol Trades] Fetching page {page}...")
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            resp.raise_for_status()
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            rows = soup.select("table tbody tr")
+
+            if not rows:
+                print(f"[Capitol Trades] No rows found on page {page}")
+                break
+
+            for row in rows:
+                cells = row.select("td")
+                if len(cells) < 8:
+                    continue
+
+                try:
+                    politician_el = cells[0]
+                    issuer_el = cells[1]
+                    traded_el = cells[3]
+                    type_el = cells[6]
+                    size_el = cells[7]
+
+                    politician = politician_el.get_text(strip=True)
+                    issuer_text = issuer_el.get_text(strip=True)
+                    ticker = clean_ticker(issuer_text)
+                    traded = traded_el.get_text(strip=True)
+                    trade_type = normalise_type(type_el.get_text(strip=True))
+                    size = size_el.get_text(strip=True)
+
+                    if not ticker:
+                        continue
+
+                    # Clean politician name (remove party/state suffix)
+                    politician = re.sub(r"(Republican|Democrat|Independent)(Senate|House)[A-Z]{2}$", "", politician).strip()
+
+                    trade = {
+                        "source": "capitol_trades",
+                        "politician": politician,
+                        "ticker": ticker,
+                        "type": trade_type,
+                        "date": _parse_date(traded),
+                        "amount": size,
+                        "asset_description": issuer_text,
+                    }
+
+                    if is_valid_stock_trade(trade):
+                        all_trades.append(trade)
+                except (IndexError, AttributeError):
+                    continue
+
+            print(f"[Capitol Trades] Page {page}: found {len(rows)} rows")
+
+        except requests.RequestException as e:
+            print(f"[Capitol Trades] Error on page {page}: {e}")
+            break
+
+    print(f"[Capitol Trades] Total valid trades: {len(all_trades)}")
+    return all_trades
 
 
-def fetch_fmp_house():
-    if not FMP_API_KEY:
-        print("[FMP] No API key set - add FMP_API_KEY to env vars")
-        return []
-    trades = []
-    url = f"{FMP_BASE}/senate-trading-rss-feed?page=0&apikey={FMP_API_KEY}"
+def _parse_date(date_str):
+    """Parse Capitol Trades date format into YYYY-MM-DD."""
+    date_str = date_str.strip()
+    # Format is like "12 Mar 2026" or "3 Apr 2026"
     try:
-        print("[House] Fetching from FMP...")
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        raw = resp.json()
-        print(f"[House] Raw trades: {len(raw)}")
-        for t in raw:
-            ticker = clean_ticker(t.get("asset", "") or t.get("ticker", ""))
-            if not ticker:
+        # Remove extra whitespace
+        clean = " ".join(date_str.split())
+        # Try common formats
+        for fmt in ["%d %b %Y", "%d %B %Y", "%Y-%m-%d"]:
+            try:
+                return datetime.strptime(clean, fmt).strftime("%Y-%m-%d")
+            except ValueError:
                 continue
-            trade = {
-                "source": "fmp_house",
-                "politician": (t.get("firstName", "") + " " + t.get("lastName", "")).strip(),
-                "ticker": ticker,
-                "type": normalise_type(t.get("type", "")),
-                "date": t.get("transactionDate", ""),
-                "disclosure_date": t.get("disclosureDate", ""),
-                "amount": t.get("amount", ""),
-                "asset_description": t.get("assetDescription", ""),
-            }
-            if is_valid_stock_trade(trade):
-                trades.append(trade)
-    except requests.RequestException as e:
-        print(f"[House] Error: {e}")
-    print(f"[House] Valid stock trades: {len(trades)}")
-    return trades
+    except Exception:
+        pass
+    return date_str
 
 
 def fetch_all_trades():
-    all_trades = []
-    all_trades.extend(fetch_fmp_senate())
-    all_trades.extend(fetch_fmp_house())
+    all_trades = scrape_capitol_trades(pages=5)
     all_trades.sort(key=lambda t: t.get("date", "1970-01-01"), reverse=True)
     members = {t["politician"] for t in all_trades}
     tickers = {t["ticker"] for t in all_trades}
