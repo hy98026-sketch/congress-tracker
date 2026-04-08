@@ -1,18 +1,13 @@
 """
 Portfolio Builder — v2
 ======================
-Improved scoring algorithm based on analysis of actual congress trading patterns.
+Improved scoring based on actual congress trading patterns.
 
-KEY IMPROVEMENTS:
-  1. OBSCURE STOCK BONUS: Non-mega-cap stocks get 3x score. That's where
-     the insider alpha is — not NVDA/AAPL that everyone buys.
-  2. TRADE SIZE WEIGHTING: $500K trade scores way more than $1K trade.
-  3. RECENCY DECAY: Trades from last 30 days score 3x more than 90+ day old.
-  4. SELL PENALTY: If members are selling a stock, it gets penalised.
-
-TWO-TIER SYSTEM:
-  Tier 1 — CONSENSUS: 2+ members buying the same stock.
-  Tier 2 — WHALE: Single member drops $50K+ on a stock.
+1. OBSCURE STOCK BONUS: Non-mega-cap stocks get 3x score
+2. TRADE SIZE WEIGHTING: $500K trade scores way more than $1K
+3. RECENCY DECAY: Last 30 days = 3x, 30-90 days = 2x, 90+ = 1x
+4. SELL PENALTY: Members selling a stock reduces its score
+5. MAX CAP: No single stock can exceed 15% of the pie
 """
 
 import json
@@ -31,18 +26,15 @@ from config import (
     HISTORY_FILE,
 )
 
-
-# ─── Mega-caps that everyone buys (low alpha signal) ─────────────────
-# These are the most commonly traded stocks by Congress — basically
-# index tracking. They still get included but at reduced weight.
 MEGA_CAPS = {
     "AAPL", "MSFT", "GOOGL", "GOOG", "AMZN", "NVDA", "META", "TSLA",
     "BRK.B", "JPM", "V", "MA", "JNJ", "UNH", "PG", "HD", "DIS",
     "BAC", "XOM", "CVX", "ABBV", "PFE", "KO", "PEP", "MRK",
     "AVGO", "COST", "TMO", "CSCO", "ACN", "WMT", "CRM",
+    "GS", "MS", "C", "WFC", "BLK", "SCHW", "AXP",
 }
 
-# ─── Amount Parsing ──────────────────────────────────────────────────
+MAX_SINGLE_ALLOCATION = 15.0
 
 AMOUNT_MIDPOINTS = {
     "$1,001 - $15,000": 8_000,
@@ -63,22 +55,14 @@ AMOUNT_MIDPOINTS = {
     "$5,000,001 -": 15_000_000,
     "$25,000,001 - $50,000,000": 37_500_000,
     "$50,000,000+": 75_000_000,
-    "1K-15K": 8_000,
-    "1K–15K": 8_000,
-    "15K-50K": 32_500,
-    "15K–50K": 32_500,
-    "50K-100K": 75_000,
-    "50K–100K": 75_000,
-    "100K-250K": 175_000,
-    "100K–250K": 175_000,
-    "250K-500K": 375_000,
-    "250K–500K": 375_000,
-    "500K-1M": 750_000,
-    "500K–1M": 750_000,
-    "1M-5M": 3_000_000,
-    "1M–5M": 3_000_000,
-    "5M-25M": 15_000_000,
-    "5M–25M": 15_000_000,
+    "1K-15K": 8_000, "1K–15K": 8_000,
+    "15K-50K": 32_500, "15K–50K": 32_500,
+    "50K-100K": 75_000, "50K–100K": 75_000,
+    "100K-250K": 175_000, "100K–250K": 175_000,
+    "250K-500K": 375_000, "250K–500K": 375_000,
+    "500K-1M": 750_000, "500K–1M": 750_000,
+    "1M-5M": 3_000_000, "1M–5M": 3_000_000,
+    "5M-25M": 15_000_000, "5M–25M": 15_000_000,
 }
 
 
@@ -88,8 +72,6 @@ def parse_amount(raw):
             return midpoint
     return 8_000
 
-
-# ─── Persistence ─────────────────────────────────────────────────────
 
 def load_portfolio():
     if os.path.exists(PORTFOLIO_FILE):
@@ -116,56 +98,31 @@ def save_history(entry):
         json.dump(history, f, indent=2, default=str)
 
 
-# ─── Scoring Helpers ─────────────────────────────────────────────────
-
-def recency_multiplier(trade_date_str):
-    """Recent trades score higher. Last 30 days = 3x, 30-90 = 2x, 90+ = 1x."""
+def recency_multiplier(date_str):
     try:
-        trade_date = datetime.strptime(trade_date_str, "%Y-%m-%d")
-        days_ago = (datetime.utcnow() - trade_date).days
+        days_ago = (datetime.utcnow() - datetime.strptime(date_str, "%Y-%m-%d")).days
         if days_ago <= 30:
             return 3.0
         elif days_ago <= 90:
             return 2.0
-        else:
-            return 1.0
+        return 1.0
     except (ValueError, TypeError):
         return 1.0
 
 
 def size_score(amount):
-    """
-    Trade size scoring — exponential, not linear.
-    $1K trade = 1 point, $100K = 10, $500K = 25, $1M+ = 50.
-    """
-    if amount >= 3_000_000:
-        return 100
-    elif amount >= 750_000:
-        return 50
-    elif amount >= 375_000:
-        return 25
-    elif amount >= 175_000:
-        return 15
-    elif amount >= 75_000:
-        return 10
-    elif amount >= 32_500:
-        return 5
-    else:
-        return 1
+    if amount >= 3_000_000: return 100
+    if amount >= 750_000: return 50
+    if amount >= 375_000: return 25
+    if amount >= 175_000: return 15
+    if amount >= 75_000: return 10
+    if amount >= 32_500: return 5
+    return 1
 
 
 def obscurity_multiplier(ticker):
-    """
-    Non-mega-cap stocks get a 3x bonus.
-    Everyone buying NVDA is index tracking. One person buying
-    a random defence contractor — that's the insider signal.
-    """
-    if ticker in MEGA_CAPS:
-        return 1.0
-    return 3.0
+    return 1.0 if ticker in MEGA_CAPS else 3.0
 
-
-# ─── Portfolio Construction ──────────────────────────────────────────
 
 def build_portfolio(trades, lookback_days=None):
     lookback_days = lookback_days or LOOKBACK_DAYS
@@ -181,12 +138,10 @@ def build_portfolio(trades, lookback_days=None):
     if not recent:
         return _empty_portfolio(lookback_days)
 
-    # Sort oldest first so latest trade per ticker wins
     recent.sort(key=lambda t: t.get("date", "1970"))
 
-    # ── Step 1: Build positions + track sells ──
     positions = defaultdict(dict)
-    sell_counts = defaultdict(int)  # How many members are selling each ticker
+    sell_counts = defaultdict(int)
 
     for t in recent:
         member = t["politician"]
@@ -203,7 +158,6 @@ def build_portfolio(trades, lookback_days=None):
             positions[member].pop(ticker, None)
             sell_counts[ticker] += 1
 
-    # ── Step 2: Aggregate with improved scoring ──
     ticker_data = defaultdict(lambda: {
         "members": set(),
         "total_score": 0,
@@ -218,8 +172,6 @@ def build_portfolio(trades, lookback_days=None):
                 ticker_data[ticker]["buy_volume"] += info["amount"]
                 if info["date"] > ticker_data[ticker]["latest_buy"]:
                     ticker_data[ticker]["latest_buy"] = info["date"]
-
-                # Calculate this holding's score
                 trade_score = (
                     size_score(info["amount"])
                     * recency_multiplier(info["date"])
@@ -227,21 +179,13 @@ def build_portfolio(trades, lookback_days=None):
                 )
                 ticker_data[ticker]["total_score"] += trade_score
 
-    # ── Step 3: Apply sell penalty ──
     for ticker in sell_counts:
         if ticker in ticker_data:
-            sells = sell_counts[ticker]
-            # Each sell reduces score by 30%
-            penalty = max(0.1, 1.0 - (sells * 0.3))
+            penalty = max(0.1, 1.0 - (sell_counts[ticker] * 0.3))
             ticker_data[ticker]["total_score"] *= penalty
-            print(f"[Portfolio] {ticker} sell penalty: {sells} sells, score x{penalty:.1f}")
+            print(f"[Portfolio] {ticker} sell penalty: {sell_counts[ticker]} sells, score x{penalty:.1f}")
 
-    # ── Step 4: Two-tier filtering ──
-    consensus = {
-        t: d for t, d in ticker_data.items()
-        if len(d["members"]) >= MIN_MEMBER_OVERLAP
-    }
-
+    consensus = {t: d for t, d in ticker_data.items() if len(d["members"]) >= MIN_MEMBER_OVERLAP}
     whale = {}
     if WHALE_TRADE_THRESHOLD > 0:
         for t, d in ticker_data.items():
@@ -261,12 +205,7 @@ def build_portfolio(trades, lookback_days=None):
 
     print(f"[Portfolio] Consensus picks: {len(consensus)}, Whale picks: {len(whale)}")
 
-    # ── Step 5: Score using the improved total_score ──
-    scores = {}
-    for t, d in eligible.items():
-        scores[t] = d["total_score"]
-
-    # ── Step 6: Top N, normalise to 100% ──
+    scores = {t: d["total_score"] for t, d in eligible.items()}
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     top = ranked[:MAX_PIE_STOCKS]
 
@@ -277,13 +216,25 @@ def build_portfolio(trades, lookback_days=None):
         if pct >= 0.5:
             allocations[ticker] = pct
 
+    # Cap any single stock at MAX_SINGLE_ALLOCATION
+    needs_redistribution = True
+    while needs_redistribution:
+        needs_redistribution = False
+        for t in allocations:
+            if allocations[t] > MAX_SINGLE_ALLOCATION:
+                allocations[t] = MAX_SINGLE_ALLOCATION
+                needs_redistribution = True
+        total_alloc = sum(allocations.values())
+        if total_alloc != 100.0 and total_alloc > 0:
+            factor = 100.0 / total_alloc
+            allocations = {t: round(p * factor, 2) for t, p in allocations.items()}
+
     # Fix rounding
     if allocations:
         diff = 100.0 - sum(allocations.values())
         biggest = max(allocations, key=allocations.get)
         allocations[biggest] = round(allocations[biggest] + diff, 2)
 
-    # ── Build detail ──
     holdings_detail = {}
     for t in allocations:
         d = ticker_data[t]
@@ -337,14 +288,12 @@ def _empty_portfolio(lookback_days):
 def compare_portfolios(old, new):
     old_a = old.get("allocations", {})
     new_a = new.get("allocations", {})
-
     added = {t: p for t, p in new_a.items() if t not in old_a}
     removed = {t: p for t, p in old_a.items() if t not in new_a}
     changed = {}
     for t in set(old_a) & set(new_a):
         if abs(old_a[t] - new_a[t]) > 0.5:
             changed[t] = {"old": old_a[t], "new": new_a[t]}
-
     return {
         "added": added,
         "removed": removed,
