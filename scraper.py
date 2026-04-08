@@ -147,7 +147,7 @@ def _parse_date(date_str):
 
 
 def fetch_all_trades():
-    all_trades = scrape_capitol_trades(pages=5)
+    all_trades = scrape_capitol_trades(pages=20)
     all_trades.sort(key=lambda t: t.get("date", "1970-01-01"), reverse=True)
     members = {t["politician"] for t in all_trades}
     tickers = {t["ticker"] for t in all_trades}
