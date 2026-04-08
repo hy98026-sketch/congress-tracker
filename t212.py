@@ -1,11 +1,8 @@
 """
 Trading 212 API Integration
-============================
-Uses T212_PIE_ID env var to track the pie (survives redeploys).
 """
 
 import base64
-import json
 import os
 import time
 
@@ -17,21 +14,15 @@ T212_PIE_ID = os.getenv("T212_PIE_ID", "")
 
 
 def _get_auth_header():
-    if not T212_API_KEY or not T212_API_SECRET:
-        raise ValueError("T212_API_KEY and T212_API_SECRET must be set")
     credentials = f"{T212_API_KEY}:{T212_API_SECRET}"
     encoded = base64.b64encode(credentials.encode()).decode()
-    return {
-        "Authorization": f"Basic {encoded}",
-        "Content-Type": "application/json",
-    }
+    return {"Authorization": f"Basic {encoded}", "Content-Type": "application/json"}
 
 
 def _make_request(method, endpoint, data=None):
     url = f"{T212_BASE_URL}{endpoint}"
-    headers = _get_auth_header()
     try:
-        resp = requests.request(method, url, headers=headers, json=data, timeout=15)
+        resp = requests.request(method, url, headers=_get_auth_header(), json=data, timeout=15)
         if resp.status_code == 429:
             time.sleep(int(resp.headers.get("Retry-After", 5)))
             return _make_request(method, endpoint, data)
@@ -46,10 +37,6 @@ def _make_request(method, endpoint, data=None):
 
 def get_instruments():
     return _make_request("GET", "/equity/metadata/instruments")
-
-
-def get_all_pies():
-    return _make_request("GET", "/equity/pies")
 
 
 def find_instrument(ticker, instruments):
@@ -71,9 +58,9 @@ def _build_shares(allocations, instruments):
         else:
             skipped.append(ticker)
     if skipped:
-        print(f"[T212] Not available on T212: {', '.join(skipped)}")
+        print(f"[T212] Not on T212: {', '.join(skipped)}")
     if not shares:
-        raise ValueError("No valid instruments found")
+        raise ValueError("No valid instruments")
     total = sum(shares.values())
     items = list(shares.items())
     result = {}
@@ -92,58 +79,30 @@ def sync_pie(allocations):
     print("[T212] Syncing pie...")
     instruments = get_instruments()
     print(f"[T212] {len(instruments)} instruments available")
-
     shares, skipped = _build_shares(allocations, instruments)
 
-    # If we have a saved pie ID, update it
     if T212_PIE_ID:
         try:
-            print(f"[T212] Updating existing pie (ID: {T212_PIE_ID})...")
-            payload = {
-                "name": PIE_NAME,
+            print(f"[T212] Updating pie {T212_PIE_ID}...")
+            result = _make_request("POST", f"/equity/pies/{T212_PIE_ID}", data={
                 "dividendCashAction": "REINVEST",
                 "instrumentShares": shares,
-            }
-            result = _make_request("POST", f"/equity/pies/{T212_PIE_ID}", data=payload)
+            })
             print(f"[T212] Updated pie with {len(shares)} instruments")
             return result
         except Exception as e:
             print(f"[T212] Update failed: {e}")
             return {}
 
-    # No saved ID — search for it by name
-    try:
-        pies = get_all_pies()
-        print(f"[T212] Found {len(pies)} pies, searching for '{PIE_NAME}'...")
-        for pie in pies:
-            name = pie.get("settings", {}).get("name", "")
-            pid = pie.get("settings", {}).get("id") or pie.get("id")
-            print(f"[T212]   Pie: '{name}' (ID: {pid})")
-            if name == PIE_NAME and pid:
-                print(f"[T212] Found pie! Add T212_PIE_ID={pid} to Railway variables!")
-                payload = {
-                    "name": PIE_NAME,
-                    "dividendCashAction": "REINVEST",
-                    "instrumentShares": shares,
-                }
-                result = _make_request("POST", f"/equity/pies/{pid}", data=payload)
-                print(f"[T212] Updated pie with {len(shares)} instruments")
-                return result
-    except Exception as e:
-        print(f"[T212] Search failed: {e}")
-
-    # Still nothing — create new pie
-    print("[T212] Creating new pie...")
-    payload = {
+    print("[T212] No T212_PIE_ID set. Creating new pie...")
+    result = _make_request("POST", "/equity/pies", data={
         "name": PIE_NAME,
         "dividendCashAction": "REINVEST",
         "endDate": None,
         "goal": 0,
         "icon": "Sparkles",
         "instrumentShares": shares,
-    }
-    result = _make_request("POST", "/equity/pies", data=payload)
+    })
     pid = result.get("settings", {}).get("id") or result.get("id")
-    print(f"[T212] Created pie '{PIE_NAME}' (ID: {pid})")
-    print(f"[T212] >>> ADD T212_PIE_ID={pid} TO RAILWAY VARIABLES <<<")
+    print(f"[T212] Created pie (ID: {pid}) — add T212_PIE_ID={pid} to Railway!")
     return result
