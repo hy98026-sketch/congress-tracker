@@ -8,12 +8,12 @@ No API key needed — free public data.
 import json
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import requests
 from bs4 import BeautifulSoup
 
-from config import DATA_DIR, TRADES_FILE, TICKER_BLACKLIST
+from config import DATA_DIR, TRADES_FILE, TICKER_BLACKLIST, SCRAPER_PAGES
 
 HEADERS = {
     "User-Agent": (
@@ -42,13 +42,19 @@ def normalise_type(raw):
     return "other"
 
 
+# Match TICKER:US or TICKER.SUFFIX:US (e.g. BRK.B:US).
+# Anything without the :US country code is rejected — this is what
+# was letting European listings (VASML, LCSTE etc.) and fund share
+# classes through and polluting the pie.
+_TICKER_RE = re.compile(r"\b([A-Z]{1,5}(?:\.[A-Z])?):US\b")
+
+
 def clean_ticker(raw):
-    match = re.search(r"([A-Z]{1,5}):US", raw)
+    if not raw:
+        return ""
+    match = _TICKER_RE.search(raw)
     if match:
         return match.group(1)
-    t = raw.strip().upper()
-    if re.match(r"^[A-Z]{1,5}$", t):
-        return t
     return ""
 
 
@@ -59,8 +65,11 @@ def is_valid_stock_trade(trade):
     return True
 
 
-def scrape_capitol_trades(pages=3):
+def scrape_capitol_trades(pages=None):
     """Scrape recent trades from Capitol Trades website."""
+    if pages is None:
+        pages = SCRAPER_PAGES
+
     all_trades = []
     base_url = "https://www.capitoltrades.com/trades"
 
@@ -75,9 +84,10 @@ def scrape_capitol_trades(pages=3):
             rows = soup.select("table tbody tr")
 
             if not rows:
-                print(f"[Capitol Trades] No rows found on page {page}")
+                print(f"[Capitol Trades] No rows found on page {page}, stopping")
                 break
 
+            page_valid = 0
             for row in rows:
                 cells = row.select("td")
                 if len(cells) < 8:
@@ -101,7 +111,11 @@ def scrape_capitol_trades(pages=3):
                         continue
 
                     # Clean politician name (remove party/state suffix)
-                    politician = re.sub(r"(Republican|Democrat|Independent)(Senate|House)[A-Z]{2}$", "", politician).strip()
+                    politician = re.sub(
+                        r"(Republican|Democrat|Independent)(Senate|House)[A-Z]{2}$",
+                        "",
+                        politician,
+                    ).strip()
 
                     trade = {
                         "source": "capitol_trades",
@@ -115,10 +129,11 @@ def scrape_capitol_trades(pages=3):
 
                     if is_valid_stock_trade(trade):
                         all_trades.append(trade)
+                        page_valid += 1
                 except (IndexError, AttributeError):
                     continue
 
-            print(f"[Capitol Trades] Page {page}: found {len(rows)} rows")
+            print(f"[Capitol Trades] Page {page}: {len(rows)} rows, {page_valid} valid US trades")
 
         except requests.RequestException as e:
             print(f"[Capitol Trades] Error on page {page}: {e}")
@@ -131,11 +146,8 @@ def scrape_capitol_trades(pages=3):
 def _parse_date(date_str):
     """Parse Capitol Trades date format into YYYY-MM-DD."""
     date_str = date_str.strip()
-    # Format is like "12 Mar 2026" or "3 Apr 2026"
     try:
-        # Remove extra whitespace
         clean = " ".join(date_str.split())
-        # Try common formats
         for fmt in ["%d %b %Y", "%d %B %Y", "%Y-%m-%d"]:
             try:
                 return datetime.strptime(clean, fmt).strftime("%Y-%m-%d")
@@ -147,7 +159,7 @@ def _parse_date(date_str):
 
 
 def fetch_all_trades():
-    all_trades = scrape_capitol_trades(pages=20)
+    all_trades = scrape_capitol_trades()
     all_trades.sort(key=lambda t: t.get("date", "1970-01-01"), reverse=True)
     members = {t["politician"] for t in all_trades}
     tickers = {t["ticker"] for t in all_trades}
@@ -156,5 +168,5 @@ def fetch_all_trades():
 
 
 def get_recent_trades(trades, days=90):
-    cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%d")
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
     return [t for t in trades if t.get("date", "9999") >= cutoff]
