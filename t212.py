@@ -40,10 +40,32 @@ def get_instruments():
 
 
 def find_instrument(ticker, instruments):
+    """Match a ticker against T212's instrument list. Handles dotted
+    tickers (BRK.B → BRKb_US_EQ on T212) by trying a few variants."""
+    # Build the candidate forms T212 might use
+    base = ticker.replace(".", "")  # BRK.B → BRKB
+    lower_suffix = ticker.replace(".", "").upper()
+
+    # Some dotted tickers on T212 use lowercase suffix: BRK.B → BRKb
+    dotted_lower = None
+    if "." in ticker:
+        head, tail = ticker.split(".", 1)
+        dotted_lower = f"{head}{tail.lower()}"
+
+    candidates = {ticker, base, lower_suffix}
+    if dotted_lower:
+        candidates.add(dotted_lower)
+
+    suffixes = ["_US_EQ", "_EQ", ""]
+
     for inst in instruments:
         t = inst.get("ticker", "")
         s = inst.get("shortName", "")
-        if t == f"{ticker}_US_EQ" or t == f"{ticker}_EQ" or t == ticker or s == ticker:
+        for c in candidates:
+            for suf in suffixes:
+                if t == f"{c}{suf}":
+                    return inst
+        if s == ticker or s == base:
             return inst
     return None
 
@@ -76,6 +98,7 @@ def _build_shares(allocations, instruments):
 
 
 def sync_pie(allocations):
+    """Sync the pie. Returns (api_result, skipped_tickers)."""
     print("[T212] Syncing pie...")
     instruments = get_instruments()
     print(f"[T212] {len(instruments)} instruments available")
@@ -89,10 +112,10 @@ def sync_pie(allocations):
                 "instrumentShares": shares,
             })
             print(f"[T212] Updated pie with {len(shares)} instruments")
-            return result
+            return result, skipped
         except Exception as e:
             print(f"[T212] Update failed: {e}")
-            return {}
+            return {}, skipped
 
     print("[T212] No T212_PIE_ID set. Creating new pie...")
     result = _make_request("POST", "/equity/pies", data={
@@ -105,4 +128,4 @@ def sync_pie(allocations):
     })
     pid = result.get("settings", {}).get("id") or result.get("id")
     print(f"[T212] Created pie (ID: {pid}) — add T212_PIE_ID={pid} to Railway!")
-    return result
+    return result, skipped
