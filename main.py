@@ -9,7 +9,7 @@ Congress Trade Tracker — Main Loop
 import sys
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 
 from config import POLL_INTERVAL, T212_API_KEY
 from scraper import fetch_all_trades, save_trades, get_recent_trades
@@ -26,12 +26,15 @@ from notifier import (
     notify_pie_synced,
     notify_error,
     notify_startup,
-    send_message,
 )
 
 
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
 def run_cycle(dry_run: bool = False):
-    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M")
+    ts = _utcnow().strftime("%Y-%m-%d %H:%M")
     print(f"\n{'='*60}")
     print(f"  Cycle start: {ts}")
     print(f"{'='*60}")
@@ -50,9 +53,12 @@ def run_cycle(dry_run: bool = False):
     new_portfolio = build_portfolio(all_trades)
     meta = new_portfolio["metadata"]
 
-    print(f"  Active members: {meta.get('active_members', 0)}")
+    print(f"  Active members:   {meta.get('active_members', 0)}")
+    print(f"  Unique tickers:   {meta.get('unique_tickers', 0)}")
     print(f"  Eligible tickers: {meta.get('eligible_tickers', 0)}")
-    print(f"  Pie stocks: {meta.get('pie_stocks', 0)}")
+    print(f"  Consensus picks:  {meta.get('consensus_picks', 0)}")
+    print(f"  Whale picks:      {meta.get('whale_picks', 0)}")
+    print(f"  Pie stocks:       {meta.get('pie_stocks', 0)}")
 
     if not new_portfolio["allocations"]:
         print("  Empty portfolio. Skipping.")
@@ -66,7 +72,8 @@ def run_cycle(dry_run: bool = False):
     for ticker, pct in top10:
         detail = new_portfolio["holdings_detail"].get(ticker, {})
         mc = detail.get("member_count", 0)
-        print(f"    {ticker:6s} {pct:5.1f}%  ({mc} members)")
+        tier = detail.get("tier", "?")
+        print(f"    {ticker:6s} {pct:5.1f}%  ({mc} members, {tier})")
 
     # 3 — Diff with previous
     print("\n[3/4] Comparing with previous...")
@@ -90,6 +97,8 @@ def run_cycle(dry_run: bool = False):
 
     # 4 — Sync to T212
     print("\n[4/4] Trading 212 sync...")
+    unavailable = []
+    sync_count = 0
     if dry_run:
         print("  DRY RUN — skipped")
     elif not T212_API_KEY:
@@ -97,8 +106,9 @@ def run_cycle(dry_run: bool = False):
     elif changes["has_changes"]:
         try:
             from t212 import sync_pie
-            result = sync_pie(new_portfolio["allocations"])
-            notify_pie_synced(result, len(new_portfolio["allocations"]), [])
+            result, unavailable = sync_pie(new_portfolio["allocations"])
+            sync_count = len(new_portfolio["allocations"]) - len(unavailable)
+            notify_pie_synced(result, sync_count, unavailable)
         except Exception as e:
             print(f"  ERROR: {e}")
             notify_error(str(e))
@@ -108,7 +118,7 @@ def run_cycle(dry_run: bool = False):
     # Save
     save_portfolio(new_portfolio)
     save_history({
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": _utcnow().isoformat(),
         "stock_count": len(new_portfolio["allocations"]),
         "active_members": meta.get("active_members", 0),
         "has_changes": changes["has_changes"],
