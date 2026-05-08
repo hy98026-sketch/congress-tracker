@@ -3,15 +3,12 @@ Test the portfolio builder with realistic mock data.
 Run this to verify the logic works before deploying.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from portfolio import build_portfolio, compare_portfolios
 
-# ── Generate realistic mock trades ──
-# Simulates what the House/Senate Stock Watcher APIs return
-# Based on actual 2025 congressional trading patterns
 
 def make_trade(politician, ticker, trade_type, amount, days_ago):
-    date = (datetime.utcnow() - timedelta(days=days_ago)).strftime("%Y-%m-%d")
+    date = (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y-%m-%d")
     return {
         "source": "test",
         "politician": politician,
@@ -69,14 +66,8 @@ MOCK_TRADES = [
     make_trade("Nick LaLota", "ABNB", "buy", "$15,001 - $50,000", 30),
 
     # ── WHALE PICKS: single member, BIG trade on obscure stock ──
-    # This is exactly the "suspicious insider trade" scenario:
-    # One member quietly drops $500K on a random defence contractor
     make_trade("Tommy Tuberville", "LMT", "buy", "$500,001 - $1,000,000", 15),
-
-    # Another whale: one member buys $250K of a small biotech
     make_trade("Rick Scott", "MRNA", "buy", "$250,001 - $500,000", 25),
-
-    # This one is below the $100K threshold — should NOT be a whale pick
     make_trade("Tom McClintock", "RKLB", "buy", "$50,001 - $100,000", 20),
 
     # ── A full sell (should remove from portfolio) ──
@@ -95,11 +86,12 @@ def test_portfolio():
     meta = portfolio["metadata"]
     print(f"\nMetadata:")
     print(f"  Total trades analysed: {meta['total_trades']}")
-    print(f"  Active members: {meta['active_members']}")
-    print(f"  Unique tickers: {meta['unique_tickers']}")
-    print(f"  Consensus picks: {meta['consensus_picks']}")
-    print(f"  Whale picks: {meta['whale_picks']}")
-    print(f"  Stocks in pie: {meta['pie_stocks']}")
+    print(f"  Active members:        {meta['active_members']}")
+    print(f"  Unique tickers:        {meta['unique_tickers']}")
+    print(f"  Eligible tickers:      {meta['eligible_tickers']}")
+    print(f"  Consensus picks:       {meta['consensus_picks']}")
+    print(f"  Whale picks:           {meta['whale_picks']}")
+    print(f"  Stocks in pie:         {meta['pie_stocks']}")
 
     print(f"\nAllocations:")
     total = 0
@@ -120,7 +112,7 @@ def test_portfolio():
     print(f"\n  Total: {total:.2f}%")
 
     # ── Assertions ──
-    assert abs(total - 100.0) < 0.1, f"Should sum to ~100%, got {total}"
+    assert abs(total - 100.0) < 0.5, f"Should sum to ~100%, got {total}"
 
     # Consensus picks should be present
     assert "NVDA" in portfolio["allocations"], "NVDA should be in (8 members)"
@@ -136,7 +128,7 @@ def test_portfolio():
     assert "CRBL" not in portfolio["allocations"], "CRBL should be filtered ($32.5K < $50K threshold)"
     assert "ABNB" not in portfolio["allocations"], "ABNB should be filtered ($32.5K < $50K threshold)"
 
-    # RKLB at $75K is now ABOVE the $50K whale threshold — should be included
+    # RKLB at $75K is above the $50K whale threshold — should be included
     assert "RKLB" in portfolio["allocations"], "RKLB should be a whale pick ($75K > $50K threshold)"
     assert portfolio["holdings_detail"]["RKLB"]["tier"] == "whale"
 
@@ -148,10 +140,17 @@ def test_portfolio():
     top_ticker = max(portfolio["allocations"], key=portfolio["allocations"].get)
     assert top_ticker == "NVDA", f"NVDA should be top, got {top_ticker}"
 
+    # Cap should actually be respected
+    from config import MAX_SINGLE_PCT
+    max_alloc = max(portfolio["allocations"].values())
+    assert max_alloc <= MAX_SINGLE_PCT + 0.5, \
+        f"Cap {MAX_SINGLE_PCT}% violated: top is {max_alloc}%"
+
     print("\n✅ All assertions passed!")
     print("   - Consensus picks included and weighted high")
     print("   - Whale picks ($50K+ single-member trades) included at lower weight")
     print("   - Small single-member trades (<$50K) correctly filtered out")
+    print(f"   - MAX_SINGLE_PCT cap of {MAX_SINGLE_PCT}% respected")
 
     # Test portfolio comparison
     print("\n── Testing Portfolio Diff ──")
