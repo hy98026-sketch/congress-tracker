@@ -3,7 +3,7 @@ Congress Trade Tracker - Configuration
 =======================================
 Tracks ALL trading Congress members. The portfolio is built from
 everyone's trades, weighted by conviction (how many members hold it)
-and volume. Re-evaluated monthly.
+and volume. Re-evaluated periodically.
 
 No curated list — the data picks the winners.
 """
@@ -26,9 +26,14 @@ T212_BASE_URL = (
 
 # ─── Scraping ────────────────────────────────────────────────────────
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "3600"))  # seconds
+# Bumped from 20 to 60 — at ~12 trades/page that's ~720 trades, enough
+# to actually cover the 180-day lookback at congressional volume.
+SCRAPER_PAGES = int(os.getenv("SCRAPER_PAGES", "60"))
 
 # ─── Portfolio ───────────────────────────────────────────────────────
 WEIGHTING_METHOD = os.getenv("WEIGHTING_METHOD", "conviction")
+# Default 2 — with 1 the filter is a no-op and single-member noise
+# dominates the pie.
 MIN_MEMBER_OVERLAP = int(os.getenv("MIN_MEMBER_OVERLAP", "2"))
 
 # WHALE PICKS: Single-member trades above this $ amount bypass the
@@ -40,6 +45,10 @@ WHALE_TRADE_THRESHOLD = int(os.getenv("WHALE_TRADE_THRESHOLD", "50000"))
 MAX_PIE_STOCKS = int(os.getenv("MAX_PIE_STOCKS", "50"))
 LOOKBACK_DAYS = int(os.getenv("LOOKBACK_DAYS", "180"))
 PIE_NAME = os.getenv("PIE_NAME", "Congress Tracker")
+
+# Hard cap on any single position's % of the pie. Applied iteratively
+# so it actually holds after renormalisation.
+MAX_SINGLE_PCT = float(os.getenv("MAX_SINGLE_PCT", "15.0"))
 
 # Skip broad ETFs (you want individual stock alpha, not index tracking)
 TICKER_BLACKLIST = {
