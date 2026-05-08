@@ -5,7 +5,7 @@ Portfolio Builder v2 — Improved congress trade scoring.
 import json
 import os
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from config import (
     WEIGHTING_METHOD,
@@ -13,6 +13,7 @@ from config import (
     WHALE_TRADE_THRESHOLD,
     MAX_PIE_STOCKS,
     LOOKBACK_DAYS,
+    MAX_SINGLE_PCT,
     DATA_DIR,
     PORTFOLIO_FILE,
     HISTORY_FILE,
@@ -25,8 +26,6 @@ MEGA_CAPS = {
     "AVGO", "COST", "TMO", "CSCO", "ACN", "WMT", "CRM",
     "GS", "MS", "C", "WFC", "BLK", "SCHW", "AXP",
 }
-
-MAX_SINGLE_PCT = 15.0
 
 AMOUNT_MIDPOINTS = {
     "$1,001 - $15,000": 8000, "$1,001 -": 8000,
@@ -56,6 +55,10 @@ def parse_amount(raw):
     return 8000
 
 
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
 def load_portfolio():
     if os.path.exists(PORTFOLIO_FILE):
         with open(PORTFOLIO_FILE, "r") as f:
@@ -70,11 +73,32 @@ def save_portfolio(portfolio):
 
 
 def save_history(entry):
+    """Append a history entry, but skip if the last entry is < 24h old.
+    With hourly polling we'd otherwise blow through the 365-cap in 15 days."""
     os.makedirs(DATA_DIR, exist_ok=True)
     history = []
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, "r") as f:
             history = json.load(f)
+
+    # De-dupe within 24h
+    if history:
+        try:
+            last_ts = datetime.fromisoformat(history[-1]["timestamp"].replace("Z", "+00:00"))
+            if last_ts.tzinfo is None:
+                last_ts = last_ts.replace(tzinfo=timezone.utc)
+            new_ts = datetime.fromisoformat(entry["timestamp"].replace("Z", "+00:00"))
+            if new_ts.tzinfo is None:
+                new_ts = new_ts.replace(tzinfo=timezone.utc)
+            if (new_ts - last_ts).total_seconds() < 23 * 3600 and not entry.get("has_changes"):
+                # Update the last entry instead of adding a new one
+                history[-1] = entry
+                with open(HISTORY_FILE, "w") as f:
+                    json.dump(history, f, indent=2, default=str)
+                return
+        except (ValueError, KeyError):
+            pass
+
     history.append(entry)
     history = history[-365:]
     with open(HISTORY_FILE, "w") as f:
@@ -83,9 +107,12 @@ def save_history(entry):
 
 def recency_mult(date_str):
     try:
-        days = (datetime.utcnow() - datetime.strptime(date_str, "%Y-%m-%d")).days
-        if days <= 30: return 3.0
-        if days <= 90: return 2.0
+        days = (_utcnow() - datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)).days
+        # Bands shifted out to account for the 45-day STOCK Act
+        # reporting lag — "30 days old" trade is often brand-new info
+        # from our point of view.
+        if days <= 60: return 3.0
+        if days <= 120: return 2.0
         return 1.0
     except Exception:
         return 1.0
@@ -101,11 +128,47 @@ def size_score(amt):
     return 1
 
 
+def _apply_cap(scores, cap_pct, max_iter=20):
+    """Iteratively cap any single score's % at cap_pct, redistributing
+    the excess proportionally to uncapped names. Returns dict of
+    ticker -> %, summing to 100."""
+    if not scores:
+        return {}
+    total = sum(scores.values())
+    if total <= 0:
+        return {}
+    pcts = {t: (s / total) * 100 for t, s in scores.items()}
+
+    for _ in range(max_iter):
+        over = {t: p for t, p in pcts.items() if p > cap_pct + 0.001}
+        if not over:
+            break
+        excess = sum(p - cap_pct for p in over.values())
+        for t in over:
+            pcts[t] = cap_pct
+        # Redistribute to under-cap names, weighted by their current %
+        under = {t: p for t, p in pcts.items() if p < cap_pct - 0.001}
+        under_total = sum(under.values())
+        if under_total <= 0:
+            # Everything is capped — flat distribute the leftover
+            # (shouldn't really happen unless cap * n_stocks < 100)
+            break
+        for t, p in under.items():
+            pcts[t] = p + excess * (p / under_total)
+
+    return pcts
+
+
 def build_portfolio(trades, lookback_days=None):
     lookback_days = lookback_days or LOOKBACK_DAYS
-    cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+    cutoff = (_utcnow() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
 
-    recent = [t for t in trades if t.get("date", "1970") >= cutoff and t.get("ticker") and t["type"] in ("buy", "sell")]
+    recent = [
+        t for t in trades
+        if t.get("date", "1970") >= cutoff
+        and t.get("ticker")
+        and t["type"] in ("buy", "sell")
+    ]
     if not recent:
         return _empty(lookback_days)
 
@@ -136,6 +199,8 @@ def build_portfolio(trades, lookback_days=None):
                 obscure = 3.0 if ticker not in MEGA_CAPS else 1.0
                 tdata[ticker]["score"] += size_score(info["amount"]) * recency_mult(info["date"]) * obscure
 
+    # Penalty for tickers that have been sold (other members exiting
+    # is bearish signal)
     for ticker, sells in sell_counts.items():
         if ticker in tdata:
             penalty = max(0.1, 1.0 - sells * 0.3)
@@ -148,36 +213,46 @@ def build_portfolio(trades, lookback_days=None):
             if len(d["members"]) == 1 and d["volume"] >= WHALE_TRADE_THRESHOLD:
                 whale[t] = d
 
-    for t in consensus: tdata[t]["tier"] = "consensus"
-    for t in whale: tdata[t]["tier"] = "whale"
+    for t in consensus:
+        tdata[t]["tier"] = "consensus"
+    for t in whale:
+        tdata[t]["tier"] = "whale"
 
     eligible = {**consensus, **whale}
     if not eligible:
-        return _empty(lookback_days)
+        return _empty(lookback_days, total_trades=len(recent),
+                      active_members=len(positions),
+                      unique_tickers=len(tdata))
 
     print(f"[Portfolio] Consensus: {len(consensus)}, Whale: {len(whale)}")
 
+    # Rank by score and take top N
     ranked = sorted(eligible.items(), key=lambda x: x[1]["score"], reverse=True)[:MAX_PIE_STOCKS]
-    total = sum(d["score"] for _, d in ranked)
+    score_map = {t: d["score"] for t, d in ranked}
 
-    alloc = {}
-    for ticker, d in ranked:
-        pct = round((d["score"] / total) * 100, 2)
-        if pct > MAX_SINGLE_PCT:
-            pct = MAX_SINGLE_PCT
-        if pct >= 0.5:
-            alloc[ticker] = pct
+    # Apply iterative cap so no single position exceeds MAX_SINGLE_PCT
+    pcts = _apply_cap(score_map, MAX_SINGLE_PCT)
 
-    # Normalise to 100
-    s = sum(alloc.values())
-    if s > 0 and s != 100:
-        alloc = {t: round(p / s * 100, 2) for t, p in alloc.items()}
+    # Drop sub-0.5% positions (T212 doesn't really do tiny allocations)
+    alloc = {t: round(p, 2) for t, p in pcts.items() if p >= 0.5}
 
-    # Fix rounding
-    diff = 100.0 - sum(alloc.values())
-    if alloc and diff != 0:
-        top = max(alloc, key=alloc.get)
-        alloc[top] = round(alloc[top] + diff, 2)
+    # Renormalise after dropping small positions, then re-cap (the
+    # drop can push other positions higher).
+    if alloc:
+        s = sum(alloc.values())
+        if s > 0 and abs(s - 100) > 0.01:
+            alloc = {t: p / s * 100 for t, p in alloc.items()}
+            alloc = _apply_cap(alloc, MAX_SINGLE_PCT)
+            alloc = {t: round(p, 2) for t, p in alloc.items()}
+
+        # Fix rounding drift to land exactly on 100
+        diff = round(100.0 - sum(alloc.values()), 2)
+        if diff != 0:
+            # Add the diff to the largest position that has room under the cap
+            for t in sorted(alloc, key=alloc.get, reverse=True):
+                if alloc[t] + diff <= MAX_SINGLE_PCT + 0.01:
+                    alloc[t] = round(alloc[t] + diff, 2)
+                    break
 
     detail = {}
     for t in alloc:
@@ -204,19 +279,39 @@ def build_portfolio(trades, lookback_days=None):
         "member_summary": msummary,
         "metadata": {
             "method": "conviction_v2",
+            "weighting": WEIGHTING_METHOD,
             "lookback_days": lookback_days,
             "total_trades": len(recent),
             "active_members": len(positions),
+            "unique_tickers": len(tdata),
+            "eligible_tickers": len(eligible),
             "consensus_picks": len(consensus),
             "whale_picks": len(whale),
             "pie_stocks": len(alloc),
         },
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": _utcnow().isoformat(),
     }
 
 
-def _empty(lookback_days):
-    return {"allocations": {}, "holdings_detail": {}, "member_summary": {}, "metadata": {"lookback_days": lookback_days, "pie_stocks": 0}, "updated_at": datetime.utcnow().isoformat()}
+def _empty(lookback_days, total_trades=0, active_members=0, unique_tickers=0):
+    return {
+        "allocations": {},
+        "holdings_detail": {},
+        "member_summary": {},
+        "metadata": {
+            "method": "conviction_v2",
+            "weighting": WEIGHTING_METHOD,
+            "lookback_days": lookback_days,
+            "total_trades": total_trades,
+            "active_members": active_members,
+            "unique_tickers": unique_tickers,
+            "eligible_tickers": 0,
+            "consensus_picks": 0,
+            "whale_picks": 0,
+            "pie_stocks": 0,
+        },
+        "updated_at": _utcnow().isoformat(),
+    }
 
 
 def compare_portfolios(old, new):
@@ -228,4 +323,9 @@ def compare_portfolios(old, new):
     for t in set(oa) & set(na):
         if abs(oa[t] - na[t]) > 0.5:
             changed[t] = {"old": oa[t], "new": na[t]}
-    return {"added": added, "removed": removed, "changed": changed, "has_changes": bool(added or removed or changed)}
+    return {
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "has_changes": bool(added or removed or changed),
+    }
