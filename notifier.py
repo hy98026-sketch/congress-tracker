@@ -71,7 +71,10 @@ def notify_pie_synced(result, available, unavailable):
     lines = ["✅ <b>T212 Pie Synced</b>\n"]
     lines.append(f"Instruments in pie: {available}")
     if unavailable:
-        lines.append(f"\n⚠️ Not available on T212: {', '.join(unavailable[:10])}")
+        lines.append(f"\n⚠️ Not available on T212 ({len(unavailable)}):")
+        lines.append(f"<code>{', '.join(unavailable[:20])}</code>")
+        if len(unavailable) > 20:
+            lines.append(f"... and {len(unavailable) - 20} more")
     send_message("\n".join(lines))
 
 
@@ -80,10 +83,11 @@ def notify_error(error):
 
 
 def notify_startup():
-    from config import WEIGHTING_METHOD, POLL_INTERVAL
+    from config import WEIGHTING_METHOD, POLL_INTERVAL, MIN_MEMBER_OVERLAP
     send_message(
         f"🚀 <b>Congress Tracker Started</b>\n\n"
         f"Tracking ALL trading members of Congress\n\n"
         f"Weighting: {WEIGHTING_METHOD}\n"
+        f"Min member overlap: {MIN_MEMBER_OVERLAP}\n"
         f"Poll interval: {POLL_INTERVAL}s"
     )
